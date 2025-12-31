@@ -79,5 +79,5 @@ Check out our detailed documentation for a deeper dive:
 ---
 
 <div align="center">
-  <p>Developed by **Team SilverFang** | Built with ❤️ by Shivam Raut</p>
+  <p>Developed by **Team SilverFang** | Built with ❤️ by Shivam Raut and Meet Shah</p>
 </div>
