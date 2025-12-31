@@ -1,555 +1,414 @@
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { gemini } from './services/geminiService';
-import { TranslationResult, TARGET_LANGUAGES, SessionHistoryItem, RiskLevel } from './types';
+import { TranslationResult, TARGET_LANGUAGES, SessionHistoryItem, RiskLevel, TTSEngine, AppMode } from './types';
 import RiskBadge from './components/RiskBadge';
-import SafetyWarning from './components/SafetyWarning';
 import SettingsPanel from './components/SettingsPanel';
 import LiveMicIndicator from './components/LiveMicIndicator';
-import MiniWaveform from './components/MiniWaveform';
+import NeuralVision from './components/NeuralVision';
+
+const DEFAULT_EL_KEY = 'd36bddd90478f0db26ae13df021d95847027f971bfadeadc4032212b6ebe4123';
 
 const App: React.FC = () => {
+  const [mode, setMode] = useState<AppMode>(AppMode.SNAPSHOT);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [targetLang, setTargetLang] = useState('English');
   const [history, setHistory] = useState<SessionHistoryItem[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [useGrounding, setUseGrounding] = useState(false);
+  const [isLiveActive, setIsLiveActive] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState<{ text: string, isModel: boolean }[]>([]);
   
-  // Settings state
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [selectedDeviceId, setSelectedDeviceId] = useState('');
-  const [sensitivity, setSensitivity] = useState(50);
+  const [ttsEngine, setTtsEngine] = useState<TTSEngine>(TTSEngine.GEMINI);
+  const [elevenLabsKey, setElevenLabsKey] = useState(localStorage.getItem('sv_el_key') || DEFAULT_EL_KEY);
+  const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState(localStorage.getItem('sv_el_voice') || '21m00Tcm4TlvDq8ikWAM');
 
-  // Filter state
-  const [filterLang, setFilterLang] = useState<string>('All');
-  const [filterRisk, setFilterRisk] = useState<string>('All');
-  
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const liveSessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const nextStartTimeRef = useRef(0);
+  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+
+  const currentTone = history[0]?.result.intent_analysis.emotional_tone || 'Neutral';
+
+  // Persist EL key if changed by user
+  useEffect(() => {
+    localStorage.setItem('sv_el_key', elevenLabsKey);
+  }, [elevenLabsKey]);
 
   useEffect(() => {
-    if (isRecording) {
-      setRecordingDuration(0);
-      timerRef.current = window.setInterval(() => {
-        setRecordingDuration(prev => prev + 1);
-      }, 1000);
-    } else {
-      if (timerRef.current) clearInterval(timerRef.current);
+    localStorage.setItem('sv_el_voice', elevenLabsVoiceId);
+  }, [elevenLabsVoiceId]);
+
+  // --- LIVE SESSION LOGIC ---
+  const toggleLiveMode = async () => {
+    if (isLiveActive) {
+      if (liveSessionRef.current) {
+        try { liveSessionRef.current.close(); } catch(e) {}
+      }
+      setIsLiveActive(false);
+      setLiveTranscript([]);
+      return;
     }
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [isRecording]);
 
-  const startRecording = async () => {
-    setError(null);
-    audioChunksRef.current = [];
-    
     try {
-      const constraints = {
-        audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true
-      };
-      
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const source = audioContext.createMediaStreamSource(stream);
-      const gainNode = audioContext.createGain();
       
-      gainNode.gain.value = (sensitivity / 50);
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+      }
       
-      const destination = audioContext.createMediaStreamDestination();
-      source.connect(gainNode);
-      gainNode.connect(destination);
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
-      const recorder = new MediaRecorder(destination.stream);
-      mediaRecorderRef.current = recorder;
+      const inputCtx = new AudioContext({ sampleRate: 16000 });
+      
+      const sessionPromise = gemini.connectLive(targetLang, {
+        onAudio: async (base64) => {
+          if (!audioContextRef.current) return;
+          const ctx = audioContextRef.current;
+          
+          if (ctx.state === 'suspended') await ctx.resume();
+          
+          nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+          const data = decodeBase64(base64);
+          const audioBuffer = await decodeAudioData(data, ctx, 24000, 1);
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(ctx.destination);
+          
+          source.onended = () => {
+            sourcesRef.current.delete(source);
+          };
 
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+          source.start(nextStartTimeRef.current);
+          nextStartTimeRef.current += audioBuffer.duration;
+          sourcesRef.current.add(source);
+        },
+        onInterruption: () => {
+          sourcesRef.current.forEach(s => {
+            try { s.stop(); } catch(e) {}
+          });
+          sourcesRef.current.clear();
+          nextStartTimeRef.current = 0;
+        },
+        onTranscription: (text, isModel) => {
+          setLiveTranscript(prev => {
+            const last = prev[prev.length - 1];
+            if (last && last.isModel === isModel) {
+              return [...prev.slice(0, -1), { text: last.text + ' ' + text, isModel }];
+            }
+            return [...prev, { text, isModel }].slice(-5);
+          });
+        }
+      });
+
+      const session = await sessionPromise;
+      liveSessionRef.current = session;
+
+      const source = inputCtx.createMediaStreamSource(stream);
+      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (!liveSessionRef.current) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(inputData.length);
+        for(let i=0; i<inputData.length; i++) pcm[i] = inputData[i] * 32767;
+        
+        session.sendRealtimeInput({ 
+          media: { 
+            data: encodeBase64(new Uint8Array(pcm.buffer)), 
+            mimeType: 'audio/pcm;rate=16000' 
+          }
+        });
       };
-
-      recorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        await handleAudioProcess(audioBlob);
-        audioContext.close();
-      };
-
-      recorder.start();
-      setIsRecording(true);
+      source.connect(processor);
+      processor.connect(inputCtx.destination);
+      
+      setIsLiveActive(true);
     } catch (err) {
-      console.error("Recording error:", err);
-      setError("Failed to access microphone. Please check permissions.");
+      console.error(err);
+      setError("Failed to start Live Neural Bridge. Check microphone permissions.");
+    }
+  };
+
+  const decodeBase64 = (b64: string) => {
+    const bin = atob(b64);
+    const res = new Uint8Array(bin.length);
+    for(let i=0; i<bin.length; i++) res[i] = bin.charCodeAt(i);
+    return res;
+  };
+
+  const encodeBase64 = (bytes: Uint8Array) => {
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  };
+
+  const decodeAudioData = async (data: Uint8Array, ctx: AudioContext, rate: number, chans: number) => {
+    const i16 = new Int16Array(data.buffer);
+    const buf = ctx.createBuffer(chans, i16.length / chans, rate);
+    for(let c=0; c<chans; c++) {
+      const cd = buf.getChannelData(c);
+      for(let i=0; i<buf.length; i++) cd[i] = i16[i * chans + c] / 32768.0;
+    }
+    return buf;
+  };
+
+  // --- SNAPSHOT LOGIC ---
+  const startRecording = async () => {
+    try {
+      setIsRecording(true);
+      setError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      const recorder = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onloadend = async () => {
+          setIsProcessing(true);
+          try {
+            const b64 = (reader.result as string).split(',')[1];
+            const result = await gemini.processAudioInput(b64, blob.type, targetLang, useGrounding, history);
+            setHistory(prev => [{ id: Date.now().toString(), timestamp: new Date(), userInput: "[Spoken]", result }, ...prev]);
+            await handleSpeak(result);
+          } catch (e) { setError("Analysis failed."); }
+          setIsProcessing(false);
+        };
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+    } catch (e) {
+      setError("Could not access microphone.");
+      setIsRecording(false);
     }
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.stop();
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-    }
+    mediaRecorderRef.current?.stop();
+    streamRef.current?.getTracks().forEach(t => t.stop());
     setIsRecording(false);
   };
 
-  const handleAudioProcess = async (blob: Blob) => {
-    setIsProcessing(true);
-    setError(null);
-    try {
-      const reader = new FileReader();
-      reader.readAsDataURL(blob);
-      reader.onloadend = async () => {
-        const base64Audio = (reader.result as string).split(',')[1];
-        const result = await gemini.processAudioInput(base64Audio, blob.type, targetLang);
-        
-        const newItem: SessionHistoryItem = {
-          id: Math.random().toString(36).substring(7),
-          timestamp: new Date(),
-          userInput: `[Audio Analysis - ${result.detected_language}]`,
-          result
-        };
-
-        setHistory(prev => [newItem, ...prev]);
-        await handleSpeak(result);
-        setIsProcessing(false);
-      };
-    } catch (err: any) {
-      console.error(err);
-      setError("Analysis failed. Please try again.");
-      setIsProcessing(false);
-    }
-  };
-
   const handleSpeak = async (result: TranslationResult) => {
+    if (!audioContextRef.current) audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+    if (audioContextRef.current.state === 'suspended') await audioContextRef.current.resume();
+
     try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const { data, engineUsed } = await gemini.speak(result.translation.translated_text, result.voice_policy, ttsEngine, elevenLabsKey, elevenLabsVoiceId);
+      let buf;
+      if (engineUsed === 'ELEVEN_LABS') {
+        buf = await audioContextRef.current.decodeAudioData(data);
+      } else {
+        buf = await decodeAudioData(new Uint8Array(data), audioContextRef.current, 24000, 1);
       }
-
-      const audioBufferData = await gemini.speak(result.translation.translated_text, result.voice_policy);
-      
-      const decodeRawPCM = async (data: Uint8Array, ctx: AudioContext) => {
-        const dataInt16 = new Int16Array(data.buffer);
-        const buffer = ctx.createBuffer(1, dataInt16.length, 24000);
-        const channelData = buffer.getChannelData(0);
-        for (let i = 0; i < dataInt16.length; i++) {
-          channelData[i] = dataInt16[i] / 32768.0;
-        }
-        return buffer;
-      };
-
-      const buffer = await decodeRawPCM(new Uint8Array(audioBufferData), audioContextRef.current);
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioContextRef.current.destination);
-      source.start();
-    } catch (e) {
-      console.error("Speech playback error:", e);
+      const src = audioContextRef.current.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioContextRef.current.destination);
+      src.start();
+    } catch (err) {
+      console.error("Speech playback error", err);
     }
   };
 
-  const clearHistory = () => {
-    if (window.confirm("Clear all session history?")) {
-      setHistory([]);
+  const sendVisionFrame = (b64: string) => {
+    if (isLiveActive && liveSessionRef.current) {
+      liveSessionRef.current.sendRealtimeInput({ media: { data: b64, mimeType: 'image/jpeg' } });
     }
-  };
-
-  const resetFilters = () => {
-    setFilterLang('All');
-    setFilterRisk('All');
-  };
-
-  const uniqueLanguages = useMemo(() => {
-    const langs = new Set(history.map(item => item.result.detected_language));
-    return Array.from(langs).sort();
-  }, [history]);
-
-  const filteredHistory = useMemo(() => {
-    return history.filter(item => {
-      const matchesLang = filterLang === 'All' || item.result.detected_language === filterLang;
-      const matchesRisk = filterRisk === 'All' || item.result.evaluation.risk_level === filterRisk;
-      return matchesLang && matchesRisk;
-    });
-  }, [history, filterLang, filterRisk]);
-
-  const filtersActive = filterLang !== 'All' || filterRisk !== 'All';
-
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 flex flex-col text-slate-200">
-      <header className="glass-panel sticky top-0 z-50 px-6 py-4 flex items-center justify-between">
+    <div className="min-h-screen bg-[#050810] flex flex-col text-slate-200 font-sans selection:bg-indigo-500/30">
+      <header className="glass-panel sticky top-0 z-50 px-6 py-4 flex items-center justify-between border-b border-white/5">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/20">
-            <i className="fas fa-shield-halved text-white text-xl"></i>
+          <div className="w-10 h-10 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
+            <i className="fas fa-microchip text-white text-xl animate-pulse"></i>
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">SentinelVoice <span className="text-indigo-400 text-sm">AI</span></h1>
-            <p className="text-[10px] text-slate-400 uppercase tracking-widest font-semibold">Responsible Translation Bridge</p>
+            <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">SentinelVoice AI</h1>
+            <p className="text-[10px] text-indigo-400/80 uppercase tracking-widest font-black">Ethereal Neural Bridge</p>
           </div>
         </div>
-        <div className="flex items-center gap-4">
-          {isRecording && (
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-rose-500/10 border border-rose-500/30 rounded-full animate-pulse mr-2">
-              <span className="w-2 h-2 rounded-full bg-rose-500 shadow-[0_0_8px_rgba(225,29,72,0.8)]"></span>
-              <span className="text-[10px] font-black text-rose-400 uppercase tracking-[0.1em]">Live REC • {formatTime(recordingDuration)}</span>
-            </div>
-          )}
-          <select 
-            value={targetLang} 
-            onChange={(e) => setTargetLang(e.target.value)}
-            className="bg-slate-800 border border-slate-700 text-slate-200 text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2 outline-none cursor-pointer"
-          >
-            {TARGET_LANGUAGES.map(lang => (
-              <option key={lang} value={lang}>{lang}</option>
-            ))}
+        <div className="flex items-center gap-3">
+          <div className="hidden sm:flex bg-slate-900/50 p-1 rounded-xl border border-white/5">
+            <button onClick={() => setMode(AppMode.SNAPSHOT)} className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${mode === AppMode.SNAPSHOT ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}>Snapshot</button>
+            <button onClick={() => setMode(AppMode.LIVE)} className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${mode === AppMode.LIVE ? 'bg-rose-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}>Live</button>
+          </div>
+          <select value={targetLang} onChange={e => setTargetLang(e.target.value)} className="bg-slate-900 border border-white/10 text-xs rounded-lg p-2 outline-none">
+            {TARGET_LANGUAGES.map(l => <option key={l} value={l}>{l}</option>)}
           </select>
-          <button 
-            onClick={() => setIsSettingsOpen(true)}
-            className="p-2.5 bg-slate-800 border border-slate-700 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-indigo-400 transition-all"
-            title="Configure Microphone"
-          >
-            <i className="fas fa-sliders text-lg"></i>
+          <button onClick={() => setIsSettingsOpen(true)} className="p-2 bg-slate-900 border border-white/10 rounded-lg text-slate-400 hover:text-indigo-400">
+            <i className="fas fa-dna"></i>
           </button>
         </div>
       </header>
 
-      <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-8 flex flex-col gap-6">
-        <section className="glass-panel rounded-3xl p-8 text-center flex flex-col items-center gap-6 relative overflow-hidden shadow-2xl">
-          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-indigo-500 to-transparent opacity-30"></div>
+      <main className="flex-1 max-w-5xl w-full mx-auto px-4 py-8 flex flex-col gap-6">
+        {error && (
+          <div className="bg-rose-500/10 border border-rose-500/30 p-4 rounded-2xl text-rose-300 text-sm flex items-center gap-3 animate-in fade-in zoom-in duration-300">
+            <i className="fas fa-circle-exclamation"></i>
+            {error}
+            <button onClick={() => setError(null)} className="ml-auto opacity-50 hover:opacity-100">✕</button>
+          </div>
+        )}
+
+        <section className="glass-panel rounded-[2.5rem] p-12 text-center flex flex-col items-center gap-8 relative overflow-hidden border-indigo-500/10 shadow-[0_0_100px_rgba(79,70,229,0.05)]">
+          <NeuralVision isActive={isLiveActive || isRecording} onFrame={sendVisionFrame} />
           
-          <div className="flex flex-col items-center">
-            <h2 className="text-2xl font-light mb-2">Safe Multilingual Communication</h2>
-            <p className="text-slate-400 text-sm max-w-md">Press and hold the microphone to record your message.</p>
+          <div className="z-10 flex flex-col items-center">
+            <h2 className="text-4xl font-black mb-2 tracking-tighter uppercase italic">
+              {mode === AppMode.LIVE ? 'Live Neural Link' : 'Intent Snapshot'}
+            </h2>
+            <div className="flex items-center gap-4">
+               {mode === AppMode.SNAPSHOT && (
+                 <label className="flex items-center gap-2 cursor-pointer group">
+                   <div className={`w-10 h-5 rounded-full relative transition-all ${useGrounding ? 'bg-emerald-600' : 'bg-slate-800'}`}>
+                     <input type="checkbox" className="hidden" checked={useGrounding} onChange={() => setUseGrounding(!useGrounding)} />
+                     <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${useGrounding ? 'left-6' : 'left-1'}`}></div>
+                   </div>
+                   <span className="text-[10px] font-bold text-slate-500 uppercase group-hover:text-emerald-400 transition-colors">Deep Grounding</span>
+                 </label>
+               )}
+            </div>
           </div>
 
-          <div className="relative group flex items-center justify-center h-48 w-48">
-            <LiveMicIndicator stream={streamRef.current} isActive={isRecording} />
-            
+          <div className="relative flex items-center justify-center h-64 w-64">
+            <div className={`absolute inset-0 rounded-full blur-[80px] transition-all duration-700 ${isLiveActive || isRecording ? 'bg-rose-600/20 scale-150' : 'bg-indigo-600/10'}`}></div>
+            <LiveMicIndicator stream={streamRef.current} isActive={isRecording || isLiveActive} tone={currentTone} />
             <button
-              onMouseDown={startRecording}
-              onMouseUp={stopRecording}
-              onMouseLeave={() => isRecording && stopRecording()}
-              onTouchStart={startRecording}
-              onTouchEnd={stopRecording}
-              disabled={isProcessing}
-              className={`relative z-10 w-32 h-32 rounded-full flex items-center justify-center transition-all duration-300 shadow-2xl ${
-                isRecording 
-                ? 'bg-rose-600 scale-110 shadow-[0_0_60px_rgba(225,29,72,0.4)] intense-mic-pulse border-4 border-rose-400/20' 
-                : 'bg-indigo-600 hover:bg-indigo-500 hover:scale-105 shadow-indigo-600/40 border-4 border-white/5'
-              } ${isProcessing ? 'opacity-50 cursor-not-allowed grayscale' : ''}`}
+              onClick={mode === AppMode.LIVE ? toggleLiveMode : undefined}
+              onMouseDown={mode === AppMode.SNAPSHOT ? startRecording : undefined}
+              onMouseUp={mode === AppMode.SNAPSHOT ? stopRecording : undefined}
+              className={`relative z-10 w-40 h-40 rounded-full flex flex-col items-center justify-center transition-all duration-500 border-4 ${
+                isLiveActive || isRecording ? 'bg-rose-600 border-rose-400/20 scale-110 shadow-[0_0_50px_rgba(225,29,72,0.4)]' : 'bg-indigo-600 border-white/5 hover:scale-105'
+              }`}
             >
-              {isProcessing ? (
-                <i className="fas fa-spinner fa-spin text-5xl"></i>
-              ) : isRecording ? (
-                <div className="flex flex-col items-center gap-2">
-                   <div className="flex items-center gap-1.5 h-10">
-                    <div className="w-1.5 bg-white h-full animate-[bounce_0.6s_infinite] [animation-delay:-0.4s] rounded-full"></div>
-                    <div className="w-1.5 bg-white h-3/4 animate-[bounce_0.6s_infinite] [animation-delay:-0.2s] rounded-full"></div>
-                    <div className="w-1.5 bg-white h-full animate-[bounce_0.6s_infinite] rounded-full"></div>
-                    <div className="w-1.5 bg-white h-3/4 animate-[bounce_0.6s_infinite] [animation-delay:-0.2s] rounded-full"></div>
-                    <div className="w-1.5 bg-white h-full animate-[bounce_0.6s_infinite] [animation-delay:-0.4s] rounded-full"></div>
-                  </div>
-                  <span className="text-[10px] font-bold text-white/80 tracking-widest">{formatTime(recordingDuration)}</span>
-                </div>
-              ) : (
-                <i className="fas fa-microphone text-5xl"></i>
-              )}
+              <i className={`fas ${isLiveActive ? 'fa-stop' : 'fa-bolt-lightning'} text-5xl mb-2`}></i>
+              <span className="text-[10px] font-black uppercase tracking-widest">{isLiveActive ? 'Close Link' : (mode === AppMode.LIVE ? 'Establish Link' : 'Hold to Sync')}</span>
             </button>
-            
-            {isRecording && (
-              <>
-                <div className="absolute inset-0 w-full h-full rounded-full border-4 border-rose-500/20 pulse-ring animate-[ping_2s_cubic-bezier(0,0,0.2,1)_infinite]"></div>
-                <div className="absolute inset-0 w-full h-full rounded-full border-2 border-rose-500/10 pulse-ring animate-[ping_3s_cubic-bezier(0,0,0.2,1)_infinite_0.5s]"></div>
-              </>
-            )}
           </div>
 
-          <div className="w-full max-w-lg min-h-[2.5rem] flex flex-col items-center justify-center mt-6">
-            {isRecording && (
-              <div className="flex flex-col items-center gap-2">
-                <div className="flex items-center gap-4 px-5 py-3 bg-rose-500/10 border border-rose-500/30 rounded-2xl shadow-[0_0_25px_rgba(225,29,72,0.15)] animate-in fade-in zoom-in duration-300">
-                  <MiniWaveform stream={streamRef.current} isActive={isRecording} />
-                  <div className="flex flex-col items-center">
-                    <p className="text-rose-400 text-[10px] font-black tracking-[0.4em] uppercase mb-1">Recording Session</p>
-                    <div className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse shadow-[0_0_8px_rgba(225,29,72,0.8)]"></span>
-                      <span className="text-slate-200 font-mono text-lg font-bold tracking-tighter">{formatTime(recordingDuration)}</span>
-                    </div>
-                  </div>
-                  <MiniWaveform stream={streamRef.current} isActive={isRecording} />
-                </div>
-                <span className="text-[10px] text-slate-500 font-bold tracking-[0.2em] animate-bounce uppercase mt-3">Release Button to Analyze Input</span>
-              </div>
-            )}
-            {isProcessing && (
-              <div className="flex flex-col items-center gap-3">
-                <div className="flex items-center gap-2">
-                  <i className="fas fa-brain text-indigo-400 animate-pulse text-xl"></i>
-                  <p className="text-indigo-400 text-sm font-medium">Synthesizing Contextual Safe-Translation...</p>
-                </div>
-                <div className="w-48 h-1 bg-slate-800 rounded-full overflow-hidden">
-                  <div className="h-full bg-indigo-500 animate-[loading_1.5s_infinite] origin-left shadow-[0_0_8px_rgba(99,102,241,0.5)]"></div>
-                </div>
-              </div>
-            )}
-            {error && <p className="text-rose-400 text-xs mt-2 font-medium bg-rose-500/10 p-2 px-4 rounded-lg border border-rose-500/20">{error}</p>}
-          </div>
-        </section>
-
-        <section className="flex flex-col gap-4 mb-20">
-          <div className="flex flex-col gap-4 px-2">
-            <div className="flex items-center justify-between">
-              <h3 className="text-lg font-bold flex items-center gap-2">
-                <i className="fas fa-history text-slate-500"></i>
-                Session Insights
-              </h3>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-slate-500 uppercase tracking-widest font-mono">
-                  {filteredHistory.length} / {history.length} ITEMS
+          {isLiveActive && (
+            <div className="z-10 w-full max-w-xl text-left bg-black/40 p-6 rounded-3xl border border-white/5 backdrop-blur-md">
+              <h4 className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-4 flex items-center justify-between">
+                <span>Neural Data Stream</span>
+                <span className="flex items-center gap-1.5 animate-pulse text-emerald-400">
+                  <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></span>
+                  Connected
                 </span>
-                {history.length > 0 && (
-                  <button 
-                    onClick={clearHistory}
-                    className="p-1.5 px-3 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 text-[10px] font-bold uppercase rounded-lg border border-rose-500/20 transition-all flex items-center gap-2"
-                  >
-                    <i className="fas fa-trash-can text-[9px]"></i>
-                    Clear History
-                  </button>
+              </h4>
+              <div className="space-y-3 min-h-[100px]">
+                {liveTranscript.length === 0 ? (
+                   <p className="text-slate-600 text-xs italic">Awaiting neural input signals...</p>
+                ) : (
+                  liveTranscript.map((t, i) => (
+                    <div key={i} className={`text-sm flex gap-3 ${t.isModel ? 'text-indigo-200 italic' : 'text-slate-400'}`}>
+                      <span className="text-[10px] font-black opacity-50 mt-1">{t.isModel ? 'AI:' : 'YOU:'}</span>
+                      <p>{t.text}</p>
+                    </div>
+                  ))
                 )}
               </div>
-            </div>
-
-            {history.length > 0 && (
-              <div className="flex flex-wrap items-end gap-4 py-4 px-4 bg-slate-900/40 rounded-2xl border border-slate-800/50">
-                <div className="flex flex-col gap-1.5 min-w-[140px]">
-                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-widest px-1 flex items-center gap-1.5">
-                    <i className="fas fa-earth-americas text-[9px]"></i>
-                    Source Language
-                  </span>
-                  <select 
-                    value={filterLang}
-                    onChange={(e) => setFilterLang(e.target.value)}
-                    className="bg-slate-950 border border-slate-800 text-slate-300 text-xs rounded-xl p-2.5 outline-none focus:ring-1 focus:ring-indigo-500 transition-all cursor-pointer hover:border-slate-700"
-                  >
-                    <option value="All">All Languages</option>
-                    {uniqueLanguages.map(lang => (
-                      <option key={lang} value={lang}>{lang}</option>
-                    ))}
-                  </select>
-                </div>
-                
-                <div className="flex flex-col gap-1.5 min-w-[140px]">
-                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-widest px-1 flex items-center gap-1.5">
-                    <i className="fas fa-shield-virus text-[9px]"></i>
-                    Risk Profile
-                  </span>
-                  <select 
-                    value={filterRisk}
-                    onChange={(e) => setFilterRisk(e.target.value)}
-                    className="bg-slate-950 border border-slate-800 text-slate-300 text-xs rounded-xl p-2.5 outline-none focus:ring-1 focus:ring-indigo-500 transition-all cursor-pointer hover:border-slate-700"
-                  >
-                    <option value="All">All Risk Levels</option>
-                    <option value={RiskLevel.LOW}>Low Risk</option>
-                    <option value={RiskLevel.MEDIUM}>Medium Risk</option>
-                    <option value={RiskLevel.HIGH}>High Risk</option>
-                  </select>
-                </div>
-
-                {filtersActive && (
-                  <button 
-                    onClick={resetFilters}
-                    className="h-[38px] px-4 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 text-[10px] font-bold uppercase rounded-xl border border-indigo-500/20 transition-all flex items-center gap-2"
-                  >
-                    <i className="fas fa-filter-circle-xmark"></i>
-                    Reset Filters
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-
-          {history.length === 0 ? (
-            <div className="text-center py-24 opacity-20 select-none grayscale">
-              <i className="fas fa-wave-square text-8xl mb-4"></i>
-              <p className="text-xl">Your conversation history will appear here.</p>
-            </div>
-          ) : filteredHistory.length === 0 ? (
-            <div className="text-center py-24 glass-panel rounded-3xl border-dashed border-slate-700">
-              <div className="w-16 h-16 bg-slate-900 rounded-full flex items-center justify-center mx-auto mb-4 border border-slate-800">
-                <i className="fas fa-filter-circle-xmark text-slate-600 text-2xl"></i>
-              </div>
-              <p className="text-slate-400 font-medium">No records match your filters.</p>
-              <p className="text-slate-600 text-xs mt-1">Try adjusting the language or risk profile settings.</p>
-              <button 
-                onClick={resetFilters}
-                className="mt-6 text-xs font-bold text-indigo-400 hover:text-indigo-300 underline underline-offset-4 decoration-indigo-500/30"
-              >
-                Clear all filters
-              </button>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-4">
-              {filteredHistory.map((item) => (
-                <div key={item.id} className="glass-panel rounded-2xl p-6 flex flex-col gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500 hover:border-slate-600 transition-colors">
-                  <div className="flex justify-between items-start">
-                    <div className="flex flex-col gap-1">
-                      <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest flex items-center gap-1">
-                        <i className="fas fa-earth-americas"></i>
-                        {item.result.detected_language} ➞ {targetLang}
-                      </span>
-                      <p className="text-slate-200 font-medium italic opacity-70">"{item.userInput}"</p>
-                    </div>
-                    <div className="flex flex-col items-end gap-2">
-                      <RiskBadge level={item.result.evaluation.risk_level} />
-                      <span className="text-[10px] text-slate-500 font-mono">
-                        {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="h-px bg-slate-800"></div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div>
-                      <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-                        <i className="fas fa-language"></i>
-                        Translation
-                      </h4>
-                      <div className="bg-slate-900/80 p-5 rounded-2xl border border-slate-800 shadow-inner">
-                        <p className="text-xl text-indigo-300 font-semibold leading-relaxed">{item.result.translation.translated_text}</p>
-                        {item.result.translation.alternate_meanings.length > 0 && (
-                          <div className="mt-3 pt-3 border-t border-slate-800/50">
-                            <p className="text-[10px] text-slate-500 font-bold uppercase mb-2 tracking-wide">Contextual Options</p>
-                            <ul className="text-xs text-slate-400 space-y-1">
-                              {item.result.translation.alternate_meanings.map((m, i) => (
-                                <li key={i} className="flex items-start gap-2">
-                                  <span className="text-indigo-500">•</span>
-                                  {m}
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div>
-                      <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-                        <i className="fas fa-magnifying-glass-chart"></i>
-                        Analysis
-                      </h4>
-                      <div className="space-y-4">
-                        <div className="flex flex-col gap-2">
-                          <div className="flex justify-between items-center text-xs">
-                            <span className="text-slate-400 font-bold uppercase tracking-tighter">Certainty</span>
-                            <span className="font-mono text-indigo-400 font-bold">{item.result.evaluation.confidence_score}%</span>
-                          </div>
-                          <div className="w-full bg-slate-800 rounded-full h-2">
-                            <div 
-                              className="bg-indigo-500 h-2 rounded-full transition-all duration-1000 shadow-[0_0_10px_rgba(99,102,241,0.5)]" 
-                              style={{ width: `${item.result.evaluation.confidence_score}%` }}
-                            ></div>
-                          </div>
-                        </div>
-                        <div className="bg-slate-900/40 p-3 rounded-xl border border-slate-800/50">
-                          <p className="text-xs font-bold text-slate-500 mb-1 uppercase tracking-widest">Reasoning</p>
-                          <p className="text-xs text-slate-300 leading-relaxed italic">
-                            "{item.result.evaluation.risk_reason}"
-                          </p>
-                          {item.result.evaluation.risk_level === RiskLevel.HIGH && (
-                            <div className="mt-2 pt-2 border-t border-slate-800/50 flex items-start gap-2">
-                              <i className="fas fa-triangle-exclamation text-rose-500 text-[10px] mt-1"></i>
-                              <p className="text-[10px] text-rose-400 font-medium">
-                                {item.result.evaluation.potential_harm}
-                              </p>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {item.result.safety.should_warn_user && (
-                    <SafetyWarning 
-                      message={item.result.safety.safety_message} 
-                      level={item.result.evaluation.risk_level} 
-                    />
-                  )}
-
-                  <div className="flex justify-between items-center mt-2 pt-2 border-t border-slate-800/20">
-                    <div className="flex items-center gap-4 text-[10px] text-slate-500 uppercase font-bold tracking-tighter">
-                      <span className="flex items-center gap-1.5 bg-slate-900 px-2 py-1 rounded">
-                        <i className="fas fa-volume-high text-indigo-500"></i>
-                        {item.result.voice_policy.voice_tone}
-                      </span>
-                      <span className="flex items-center gap-1.5 bg-slate-900 px-2 py-1 rounded">
-                        <i className="fas fa-gauge-high text-emerald-500"></i>
-                        {item.result.voice_policy.speaking_speed}
-                      </span>
-                    </div>
-                    <button 
-                      onClick={() => handleSpeak(item.result)}
-                      className="flex items-center gap-2 px-4 py-2 bg-indigo-600/10 hover:bg-indigo-600/20 border border-indigo-500/20 rounded-xl text-xs font-bold text-indigo-400 transition-all hover:scale-105 active:scale-95"
-                    >
-                      <i className="fas fa-play"></i>
-                      Replay Audio
-                    </button>
-                  </div>
-                </div>
-              ))}
             </div>
           )}
+
+          {isProcessing && (
+            <div className="flex items-center gap-2 text-indigo-400 animate-pulse">
+              <i className="fas fa-brain"></i>
+              <span className="text-xs font-bold uppercase tracking-widest">Synthesizing Intent...</span>
+            </div>
+          )}
+        </section>
+
+        <section className="grid grid-cols-1 gap-6 mb-32">
+          {history.map((item) => (
+            <div key={item.id} className="glass-panel rounded-3xl p-8 border-l-4 border-l-indigo-500 animate-in slide-in-from-bottom-8 duration-700">
+              <div className="flex justify-between items-start mb-6">
+                <div className="flex items-center gap-3">
+                  <span className="px-3 py-1 bg-indigo-500/10 rounded-full text-[10px] font-black text-indigo-400 border border-indigo-500/20 uppercase">{item.result.detected_language} ➔ {targetLang}</span>
+                  <RiskBadge level={item.result.evaluation.risk_level} />
+                </div>
+                <div className="flex items-center gap-6">
+                  <button 
+                    onClick={() => handleSpeak(item.result)}
+                    className="flex items-center gap-2 text-indigo-400 hover:text-indigo-300 transition-colors group"
+                  >
+                    <span className="text-[10px] font-black uppercase opacity-0 group-hover:opacity-100 transition-opacity">Replay Neural Sync</span>
+                    <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                      <i className="fas fa-play text-xs"></i>
+                    </div>
+                  </button>
+                  <div className="text-right">
+                     <div className="text-[10px] text-slate-600 font-bold uppercase tracking-tighter">Sync Integrity</div>
+                     <div className="text-xl font-black text-emerald-400 italic">{(item.result.intent_analysis.consistency_score * 100).toFixed(0)}%</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-slate-900/40 p-8 rounded-[2rem] border border-white/5 mb-6">
+                <p className="text-3xl text-indigo-100 font-medium leading-tight mb-4">{item.result.translation.translated_text}</p>
+                {item.result.translation.semantic_explanation && (
+                  <p className="text-sm text-slate-400 italic border-l-2 border-indigo-500/30 pl-4">{item.result.translation.semantic_explanation}</p>
+                )}
+              </div>
+
+              {item.result.grounding_info && (
+                <div className="mb-6 p-4 bg-emerald-500/5 border border-emerald-500/10 rounded-2xl">
+                   <h4 className="text-[10px] font-black text-emerald-400 uppercase tracking-widest mb-3 flex items-center gap-2">
+                     <i className="fas fa-earth-americas"></i> Neural Grounding References
+                   </h4>
+                   <div className="flex flex-wrap gap-2">
+                     {item.result.grounding_info.sources.map((s, i) => (
+                       <a key={i} href={s.uri} target="_blank" className="text-[10px] bg-slate-900 border border-white/5 px-3 py-1.5 rounded-lg hover:bg-emerald-500/20 transition-all text-slate-400 hover:text-emerald-300">
+                         {s.title} <i className="fas fa-external-link-alt ml-1 opacity-50"></i>
+                       </a>
+                     ))}
+                   </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                 <div className="p-5 bg-slate-950/50 rounded-2xl border border-white/5">
+                   <h4 className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-2">Internal Reasoning</h4>
+                   <p className="text-xs text-slate-400 leading-relaxed italic">"{item.result.evaluation.reasoning_summary}"</p>
+                 </div>
+                 <div className="p-5 bg-slate-950/50 rounded-2xl border border-white/5">
+                    <h4 className="text-[9px] font-black text-slate-500 uppercase tracking-widest mb-2">Intent Preservation</h4>
+                    <div className="flex items-center gap-4">
+                      <div className="flex-1">
+                        <div className="text-[10px] text-slate-500 uppercase mb-1">{item.result.intent_analysis.emotional_tone}</div>
+                        <div className="h-1 bg-slate-800 rounded-full overflow-hidden">
+                          <div className="h-full bg-indigo-500" style={{ width: `${item.result.intent_analysis.consistency_score * 100}%` }}></div>
+                        </div>
+                      </div>
+                      <div className="w-10 h-10 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-400">
+                        <i className="fas fa-bullseye"></i>
+                      </div>
+                    </div>
+                 </div>
+              </div>
+            </div>
+          ))}
         </section>
       </main>
 
       <SettingsPanel 
-        isOpen={isSettingsOpen} 
-        onClose={() => setIsSettingsOpen(false)}
-        selectedDeviceId={selectedDeviceId}
-        onDeviceChange={setSelectedDeviceId}
-        sensitivity={sensitivity}
-        onSensitivityChange={setSensitivity}
+        isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)}
+        ttsEngine={ttsEngine} onTtsEngineChange={setTtsEngine}
+        elevenLabsKey={elevenLabsKey} onElevenLabsKeyChange={setElevenLabsKey}
+        elevenLabsVoiceId={elevenLabsVoiceId} onElevenLabsVoiceIdChange={setElevenLabsVoiceId}
+        availableVoices={[]} isFetchingVoices={false}
+        sensitivity={50} onSensitivityChange={() => {}}
+        selectedDeviceId="" onDeviceChange={() => {}}
       />
-
-      <footer className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 py-3 px-6 flex justify-between items-center z-50 shadow-[0_-4px_20px_rgba(0,0,0,0.5)]">
-        <div className="flex items-center gap-5 text-[10px] text-slate-500 tracking-wider font-bold">
-          <span className="flex items-center gap-1.5 px-2 py-0.5 bg-indigo-500/5 rounded">
-            <i className="fas fa-brain text-indigo-500 opacity-80"></i> GEMINI 3 FLASH
-          </span>
-          <span className="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-500/5 rounded">
-            <i className="fas fa-microphone-lines text-emerald-500 opacity-80"></i> {selectedDeviceId ? 'DEVICE CUSTOM' : 'DEFAULT'}
-          </span>
-        </div>
-        <div className="text-[10px] text-slate-500 font-mono opacity-60">
-          SENTINELVOICE-PRO-v1.0
-        </div>
-      </footer>
-      <style>{`
-        @keyframes loading {
-          0% { transform: scaleX(0); }
-          50% { transform: scaleX(1); }
-          100% { transform: scaleX(0); transform-origin: right; }
-        }
-        @keyframes intense-mic-pulse {
-          0% { transform: scale(1.1); box-shadow: 0 0 0 0 rgba(225, 29, 72, 0.6); }
-          70% { transform: scale(1.18); box-shadow: 0 0 0 25px rgba(225, 29, 72, 0); }
-          100% { transform: scale(1.1); box-shadow: 0 0 0 0 rgba(225, 29, 72, 0); }
-        }
-        .intense-mic-pulse {
-          animation: intense-mic-pulse 1.5s infinite cubic-bezier(0.4, 0, 0.2, 1);
-        }
-      `}</style>
     </div>
   );
 };
