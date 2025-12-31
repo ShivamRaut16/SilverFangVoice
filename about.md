@@ -42,5 +42,5 @@ The project is built on a high-performance, modern tech stack:
 
 ---
 <div align="center">
-  <p>Developed by **Team SilverFang** | Built with ❤️ by Shivam Raut</p>
+  <p>Developed by **Team SilverFang** | Built with ❤️ by Shivam Raut and Meet Shah</p>
 </div>
