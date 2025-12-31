@@ -102,7 +102,7 @@ export class GeminiService {
     }
 
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview",
+      model: "gemini-2.0-flash",
       contents: [{ parts: [{ inlineData: { data: audioBase64, mimeType } }, { text: promptText }] }],
       config
     });
